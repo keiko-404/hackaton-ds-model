@@ -1,29 +1,58 @@
 import re
+
 import joblib
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from scipy.sparse import hstack
+
 
 app = FastAPI(
     title="API Clasificador de Contenido Técnico",
-    description="Clasifica contenido técnico y extrae palabras clave usando un modelo  de Regresión Logística.",
+    description="Servicio de inferencia conforme al contrato REST TM-006",
     version="1.0.0"
 )
+
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError
+):
+    errores = []
+
+    for error in exc.errors():
+        campo = " -> ".join(str(x) for x in error["loc"] if x != "body")
+        errores.append(f"{campo}: {error['msg']}")
+
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "entrada_invalida",
+            "detalle": "; ".join(errores)
+        }
+    )
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    #aqui dice que hay que poner el link de la empresa para darle permiso
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-
 )
 
-modelo = joblib.load("modelo_clasificador.joblib")
-vect_titulo = joblib.load("tfidf_titulo.joblib")
-vect_texto = joblib.load("tfidf_texto.joblib")
+MODELO_CARGADO = False
+try:
+    modelo = joblib.load("modelo_clasificador.joblib")
+    vect_titulo = joblib.load("tfidf_titulo.joblib")
+    vect_texto = joblib.load("tfidf_texto.joblib")
+    MODELO_CARGADO = True
+except Exception:
+    modelo = vect_titulo = vect_texto = None
 
 PESO_TITULO = 2.0
 
@@ -39,66 +68,69 @@ NORMALIZACIONES = {
     r"\bci\s*/\s*cd\b": "cicd",
 }
 
-def limpiar_texto_api(texto: str) -> str:
+def limpiar_texto_api(texto:str)->str:
     texto = texto.lower()
-    for patron, reemplazo in NORMALIZACIONES.items():
-        texto = re.sub(patron, reemplazo, texto)
-    texto = re.sub(r"http\S+|www\.\S+", " ", texto)
-    texto = re.sub(r"[^\w\sáéíóúñü]", " ", texto)
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto
+    for p,r in NORMALIZACIONES.items():
+        texto = re.sub(p,r,texto)
+    texto = re.sub(r"http\S+|www\.\S+"," ",texto)
+    texto = re.sub(r"[^\w\sáéíóúñü]"," ",texto)
+    return re.sub(r"\s+"," ",texto).strip()
 
-class SolicitudClasificacion(BaseModel):
-    titulo: str = Field(..., example="Curso de Python para análisis de datos")
-    texto: str = Field(..., example="Aprende pandas, numpy, matplotlib y machine learning.")
-    top_n_palabras: int = Field(5, ge=1, le=20, example=5)
 
-class RespuestaClasificacion(BaseModel):
-    categoria: str
-    probabilidad: float
-    informacion_adicional: list[str]
+class PredictRequest(BaseModel):
+    titulo: str
+    texto: str
+
+class PredictResponse(BaseModel):
+    categoria:str
+    probabilidad:float
+    informacion_adicional:list[str]
 
 @app.get("/")
 def inicio():
-    return {"mensaje": "API de clasificación funcionando correctamente"}
+    return {"mensaje":"API de clasificación funcionando correctamente"}
 
 @app.get("/health")
-def health_check():
-    esta_cargado = modelo is not None and vect_titulo is not None and vect_texto is not None
+def health():
+    if MODELO_CARGADO:
+        return {"estado":"ok","modelo_cargado":True}
+    raise HTTPException(status_code=503,detail={"estado":"degradado","modelo_cargado":False})
 
-    return {
-        "estado": "ok" if esta_cargado else "degradado",
-        "modelo_cargado": esta_cargado
-    }
+@app.post("/predict",response_model=PredictResponse)
+def predict(datos:PredictRequest):
+    if not MODELO_CARGADO:
+        raise HTTPException(status_code=503,detail={
+            "error":"modelo_no_cargado",
+            "detalle":"Descarga del artefacto desde OCI Object Storage en curso."
+        })
+    titulo=limpiar_texto_api(datos.titulo)
+    texto=limpiar_texto_api(datos.texto)
+    if not texto:
+        raise HTTPException(status_code=422,detail={
+            "error":"texto_vacio_tras_limpieza",
+            "detalle":"El texto no contiene tokens útiles luego del preprocesamiento."
+        })
+    try:
+        vt=vect_titulo.transform([titulo])*PESO_TITULO
+        vx=vect_texto.transform([texto])
+        vec=hstack([vt,vx])
+        categoria=modelo.predict(vec)[0]
+        prob=round(float(modelo.predict_proba(vec)[0].max()),4)
+        nombres=list(vect_titulo.get_feature_names_out())+list(vect_texto.get_feature_names_out())
+        d=vec.toarray()[0]
+        idx=d.argsort()[::-1][:20]
+        palabras=[nombres[i] for i in idx if d[i]>0]
+        return {
 
-@app.post("/predict", response_model=RespuestaClasificacion)
-def clasificar(datos: SolicitudClasificacion):
-    titulo_limpio = limpiar_texto_api(datos.titulo)
-    descripcion_limpia = limpiar_texto_api(datos.texto)
+            "categoria": categoria,
+            "probabilidad": prob,
+            "informacion_adicional": palabras if palabras is not None else []
+}
+    except Exception:
+        raise HTTPException(status_code=500,detail={
+            "error":"error_interno_modelo",
+            "detalle":"Error al ejecutar el modelo."
+        })
 
-    v_titulo = vect_titulo.transform([titulo_limpio]) * PESO_TITULO
-    v_texto = vect_texto.transform([descripcion_limpia])
-    vector = hstack([v_titulo, v_texto])
 
-    categoria = modelo.predict(vector)[0]
-    probabilidades = modelo.predict_proba(vector)[0]
-    probabilidad = round(float(probabilidades.max()), 4)
-
-    nombres_features = (
-        list(vect_titulo.get_feature_names_out())
-        + list(vect_texto.get_feature_names_out())
-    )
-
-    vector_denso = vector.toarray()[0]
-    indices_top = vector_denso.argsort()[::-1][:datos.top_n_palabras]
-    palabras_clave = [
-        nombres_features[i]
-        for i in indices_top
-        if vector_denso[i] > 0
-    ]
-
-    return {
-        "categoria": categoria,
-        "probabilidad": probabilidad,
-        "informacion_adicional": palabras_clave,
-    }
+#py -3.12 -m uvicorn app:app --reload
